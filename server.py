@@ -1,5 +1,4 @@
 import os
-import secrets
 import uuid
 import subprocess
 
@@ -7,11 +6,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from fastmcp import FastMCP
+from fastmcp.server.auth.providers.github import GitHubProvider
 
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route, Mount
-from starlette.middleware.base import BaseHTTPMiddleware
 
 
 # ==========================================
@@ -19,6 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # ==========================================
 
 load_dotenv()
+
 
 # ==========================================
 # 2. CONFIGURATION
@@ -29,6 +29,19 @@ BASE_DIR = Path(__file__).parent.resolve()
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+SERVER_URL = os.getenv(
+    "BASE_URL",
+    "https://manim-mcp-server-i1dc.onrender.com"
+)
+
+CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+
+if not CLIENT_ID or not CLIENT_SECRET:
+    raise RuntimeError(
+        "Missing GITHUB_CLIENT_ID or GITHUB_CLIENT_SECRET"
+    )
+
 MANIM_QUALITY = {
     "low": "l",
     "medium": "m",
@@ -36,15 +49,31 @@ MANIM_QUALITY = {
     "production": "p"
 }
 
-# ==========================================
-# 3. INITIALIZE FASTMCP
-# ==========================================
-
-mcp = FastMCP("Remote Manim MCP Server")
-
 
 # ==========================================
-# 4. MANIM RENDERING TOOL
+# 3. GITHUB OAUTH AUTHENTICATION
+# ==========================================
+
+auth = GitHubProvider(
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+    base_url=SERVER_URL,
+    redirect_path="/auth/callback"
+)
+
+
+# ==========================================
+# 4. INITIALIZE FASTMCP
+# ==========================================
+
+mcp = FastMCP(
+    name="Remote Manim MCP Server",
+    auth=auth
+)
+
+
+# ==========================================
+# 5. MANIM RENDERING TOOL
 # ==========================================
 
 @mcp.tool()
@@ -96,7 +125,6 @@ def render_manim(
     ]
 
     try:
-
         result = subprocess.run(
             command,
             capture_output=True,
@@ -124,7 +152,7 @@ def render_manim(
 
         video_path = videos[0]
 
-        video_url = f"/videos/{job_id}"
+        video_url = f"{SERVER_URL}/videos/{job_id}"
 
         return {
             "success": True,
@@ -135,14 +163,12 @@ def render_manim(
         }
 
     except subprocess.TimeoutExpired:
-
         return {
             "success": False,
             "error": "Rendering timed out after 300 seconds"
         }
 
     except Exception as e:
-
         return {
             "success": False,
             "error": str(e)
@@ -150,19 +176,19 @@ def render_manim(
 
 
 # ==========================================
-# 5. HEALTH CHECK
+# 6. HEALTH CHECK
 # ==========================================
 
 async def health(request):
-
     return JSONResponse({
         "status": "online",
-        "server": "Remote Manim MCP"
+        "server": "Remote Manim MCP",
+        "authentication": "GitHub OAuth"
     })
 
 
 # ==========================================
-# 6. VIDEO DOWNLOAD ENDPOINT
+# 7. VIDEO DOWNLOAD ENDPOINT
 # ==========================================
 
 async def get_video(request):
@@ -200,67 +226,33 @@ async def get_video(request):
 
 
 # ==========================================
-# 7. STARLETTE APPLICATION
+# 8. CREATE MCP HTTP APPLICATION
+# ==========================================
+
+mcp_app = mcp.http_app(path="/mcp")
+
+
+# ==========================================
+# 9. STARLETTE APPLICATION
 # ==========================================
 
 app = Starlette(
     routes=[
         Route("/health", health),
         Route("/videos/{job_id}", get_video),
-        Mount("/", app=mcp.http_app()),
-    ]
+
+        # OAuth discovery routes must be at the root.
+        *auth.get_well_known_routes(mcp_path="/mcp"),
+
+        # MCP and OAuth operational endpoints.
+        Mount("/", app=mcp_app),
+    ],
+    lifespan=mcp_app.lifespan
 )
 
 
 # ==========================================
-# 8. API KEY AUTHENTICATION
-# ==========================================
-
-class APIKeyMiddleware(BaseHTTPMiddleware):
-
-    async def dispatch(self, request, call_next):
-
-        # Health check remains public
-        if request.url.path == "/health":
-            return await call_next(request)
-
-        expected_key = os.environ.get("MCP_API_KEY")
-
-        if not expected_key:
-
-            return JSONResponse(
-                {"error": "Authentication not configured"},
-                status_code=503
-            )
-
-        auth_header = request.headers.get(
-            "Authorization", ""
-        )
-
-        supplied_key = (
-            auth_header[7:].strip()
-            if auth_header.startswith("Bearer ")
-            else ""
-        )
-
-        if not secrets.compare_digest(
-            supplied_key,
-            expected_key
-        ):
-
-            return JSONResponse(
-                {"error": "Unauthorized"},
-                status_code=401
-            )
-
-        return await call_next(request)
-
-
-app.add_middleware(APIKeyMiddleware)
-
-
-# ==========================================
-# 9. START SERVER
+# 10. START SERVER
 # ==========================================
 
 if __name__ == "__main__":
